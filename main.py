@@ -12,6 +12,9 @@ import time
 import os
 from typing import Dict, List, Tuple
 import warnings
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 warnings.filterwarnings('ignore')
 
 class Strategy:
@@ -26,133 +29,164 @@ class Strategy:
         self.volume_threshold = 1.5  # 涨停次日放量阈值
         self.max_limit_up_days = 2  # 最大涨停天数
         self.lookback_period = 10  # 回溯期
+        self.session = self.create_session()
         
+    def create_session(self):
+        """创建带重试机制的会话"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
     def get_stock_pool(self) -> pd.DataFrame:
         """
         获取基础股票池 (沪深主板 + 创业板，排除ST、科创板、北交所)
         """
         print("正在获取股票列表...")
         
-        # 获取A股实时行情数据
-        stock_zh_a_spot = ak.stock_zh_a_spot_em()
-        
-        # 筛选条件：
-        # 1. 排除ST股票
-        # 2. 排除科创板(688)、北交所(4/8开头)
-        # 3. 只保留主板和创业板
-        stock_pool = stock_zh_a_spot[
-            (~stock_zh_a_spot['代码'].str.startswith(('688', '4', '8'))) &
-            (~stock_zh_a_spot['名称'].str.contains('ST')) &
-            (stock_zh_a_spot['总市值'] >= self.min_market_cap * 1e8) &
-            (stock_zh_a_spot['总市值'] <= self.max_market_cap * 1e8)
-        ].copy()
-        
-        print(f"基础股票池共 {len(stock_pool)} 只股票")
-        return stock_pool
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 获取A股实时行情数据
+                stock_zh_a_spot = ak.stock_zh_a_spot_em()
+                
+                # 筛选条件：
+                # 1. 排除ST股票
+                # 2. 排除科创板(688)、北交所(4/8开头)
+                # 3. 只保留主板和创业板
+                stock_pool = stock_zh_a_spot[
+                    (~stock_zh_a_spot['代码'].str.startswith(('688', '4', '8'))) &
+                    (~stock_zh_a_spot['名称'].str.contains('ST')) &
+                    (stock_zh_a_spot['总市值'] >= self.min_market_cap * 1e8) &
+                    (stock_zh_a_spot['总市值'] <= self.max_market_cap * 1e8)
+                ].copy()
+                
+                print(f"基础股票池共 {len(stock_pool)} 只股票")
+                return stock_pool
+            except Exception as e:
+                print(f"获取股票池失败，第 {attempt + 1} 次尝试: {e}")
+                if attempt == max_retries - 1:
+                    print("获取股票池失败，返回空数据")
+                    return pd.DataFrame()
+                time.sleep(2)  # 等待2秒后重试
+        return pd.DataFrame()
     
     def check_pattern(self, symbol: str, days: int = 10) -> Dict:
         """
         检查股票是否满足涨停启动后缩量回调形态
         """
         try:
-            # 获取股票历史数据
-            stock_zh_a_hist = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="")
-            
-            if len(stock_zh_a_hist) < days:
-                return None
-                
-            # 只取最近days天的数据
-            hist_data = stock_zh_a_hist.tail(days).reset_index(drop=True)
-            
-            # 计算涨跌幅
-            hist_data['pct_change'] = hist_data['收盘'].pct_change() * 100
-            
-            # 识别涨停日 (涨幅 >= 9.8% 为涨停，考虑误差)
-            limit_up_mask = hist_data['pct_change'] >= 9.8
-            
-            # 检查涨停条件：T-3至T-10内出现1次单日涨停或连续2日涨停，且总数不超过2次
-            valid_limit_up_dates = []
-            consecutive_count = 0
-            total_limit_up = 0
-            
-            for i in range(3, len(limit_up_mask)-1):  # 从T-3开始检查
-                if limit_up_mask.iloc[i]:
-                    total_limit_up += 1
-                    if consecutive_count == 0:
-                        consecutive_count = 1
-                    else:
-                        consecutive_count += 1
-                else:
-                    if consecutive_count > 0:
-                        # 记录连续涨停结束
-                        if consecutive_count <= 2:  # 连续涨停不超过2天
-                            valid_limit_up_dates.extend(list(range(i-consecutive_count, i)))
-                        consecutive_count = 0
-            
-            # 处理循环结束后仍处于连续状态的情况
-            if consecutive_count > 0:
-                if consecutive_count <= 2:
-                    valid_limit_up_dates.extend(list(range(len(limit_up_mask)-consecutive_count, len(limit_up_mask))))
-            
-            # 检查条件
-            if total_limit_up == 0 or total_limit_up > self.max_limit_up_days:
-                return None
-            
-            # 检查是否存在连续涨停超过2天的情况
-            if len(valid_limit_up_dates) != total_limit_up:
-                return None
-                
-            # 确定最后一个涨停日
-            last_limit_up_idx = max([i for i in range(len(limit_up_mask)) if limit_up_mask.iloc[i]])
-            
-            # 检查涨停后是否有跌停
-            has_limit_down = False
-            for j in range(last_limit_up_idx + 1, len(hist_data)):
-                if hist_data['pct_change'].iloc[j] <= -9.8:
-                    has_limit_down = True
-                    break
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    # 获取股票历史数据
+                    stock_zh_a_hist = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="")
                     
-            if has_limit_down:
-                return None
-                
-            # 检查涨停次日成交量是否放大 >= 1.5倍
-            volume_burst_day_idx = last_limit_up_idx + 1
-            if volume_burst_day_idx >= len(hist_data):
-                return None
-                
-            limit_up_volume = hist_data['成交量'].iloc[last_limit_up_idx]
-            burst_day_volume = hist_data['成交量'].iloc[volume_burst_day_idx]
-            
-            volume_ratio = burst_day_volume / limit_up_volume if limit_up_volume > 0 else 0
-            
-            if volume_ratio < self.volume_threshold:
-                return None
-                
-            # 检查从爆量日后一天开始是否持续缩量
-            has_higher_volume_after_burst = False
-            for k in range(volume_burst_day_idx + 1, len(hist_data)):
-                if hist_data['成交量'].iloc[k] >= burst_day_volume:
-                    has_higher_volume_after_burst = True
-                    break
+                    if len(stock_zh_a_hist) < days:
+                        return None
+                        
+                    # 只取最近days天的数据
+                    hist_data = stock_zh_a_hist.tail(days).reset_index(drop=True)
                     
-            if has_higher_volume_after_burst:
-                return None
-                
-            # 返回符合条件的股票信息
-            current_price = hist_data['收盘'].iloc[-1]
-            market_cap = hist_data['总市值'].iloc[-1] / 1e8  # 转换为亿
-            limit_up_date = hist_data['日期'].iloc[last_limit_up_idx]
-            
-            return {
-                'code': symbol,
-                'name': '',  # 后续补充
-                'current_price': round(current_price, 2),
-                'market_cap': round(market_cap, 2),
-                'limit_up_date': limit_up_date,
-                'volume_ratio': round(volume_ratio, 2),
-                'industry': ''  # 后续补充
-            }
-            
+                    # 计算涨跌幅
+                    hist_data['pct_change'] = hist_data['收盘'].pct_change() * 100
+                    
+                    # 识别涨停日 (涨幅 >= 9.8% 为涨停，考虑误差)
+                    limit_up_mask = hist_data['pct_change'] >= 9.8
+                    
+                    # 检查涨停条件：T-3至T-10内出现1次单日涨停或连续2日涨停，且总数不超过2次
+                    consecutive_count = 0
+                    total_limit_up = 0
+                    limit_up_indices = []
+                    
+                    for i in range(3, len(limit_up_mask)-1):  # 从T-3开始检查
+                        if limit_up_mask.iloc[i]:
+                            total_limit_up += 1
+                            limit_up_indices.append(i)
+                            
+                    # 检查条件
+                    if total_limit_up == 0 or total_limit_up > self.max_limit_up_days:
+                        return None
+                    
+                    # 检查是否存在连续涨停超过2天的情况
+                    # 检查是否存在连续涨停（如T-3和T-4都涨停，或T-4和T-5都涨停等）
+                    consecutive_exists = False
+                    for i in range(len(limit_up_indices)-1):
+                        if limit_up_indices[i+1] - limit_up_indices[i] == 1:  # 相邻的涨停日
+                            consecutive_exists = True
+                            break
+                    
+                    if consecutive_exists and total_limit_up > 2:
+                        return None
+                    
+                    # 确定最后一个涨停日
+                    last_limit_up_idx = max(limit_up_indices) if limit_up_indices else -1
+                    if last_limit_up_idx == -1:
+                        return None
+                        
+                    # 检查涨停后是否有跌停
+                    has_limit_down = False
+                    for j in range(last_limit_up_idx + 1, len(hist_data)):
+                        if hist_data['pct_change'].iloc[j] <= -9.8:
+                            has_limit_down = True
+                            break
+                            
+                    if has_limit_down:
+                        return None
+                        
+                    # 检查涨停次日成交量是否放大 >= 1.5倍
+                    volume_burst_day_idx = last_limit_up_idx + 1
+                    if volume_burst_day_idx >= len(hist_data):
+                        return None
+                        
+                    limit_up_volume = hist_data['成交量'].iloc[last_limit_up_idx]
+                    burst_day_volume = hist_data['成交量'].iloc[volume_burst_day_idx]
+                    
+                    volume_ratio = burst_day_volume / limit_up_volume if limit_up_volume > 0 else 0
+                    
+                    if volume_ratio < self.volume_threshold:
+                        return None
+                        
+                    # 检查从爆量日后一天开始是否持续缩量
+                    has_higher_volume_after_burst = False
+                    for k in range(volume_burst_day_idx + 1, len(hist_data)):
+                        if hist_data['成交量'].iloc[k] >= burst_day_volume:
+                            has_higher_volume_after_burst = True
+                            break
+                            
+                    if has_higher_volume_after_burst:
+                        return None
+                        
+                    # 返回符合条件的股票信息
+                    current_price = hist_data['收盘'].iloc[-1]
+                    market_cap = hist_data['总市值'].iloc[-1] / 1e8  # 转换为亿
+                    limit_up_date = hist_data['日期'].iloc[last_limit_up_idx]
+                    
+                    return {
+                        'code': symbol,
+                        'name': '',  # 后续补充
+                        'current_price': round(current_price, 2),
+                        'market_cap': round(market_cap, 2),
+                        'limit_up_date': limit_up_date,
+                        'volume_ratio': round(volume_ratio, 2),
+                        'industry': '',  # 后续补充
+                        'buy_point': round(current_price * 0.98, 2),  # 建议买入点（当前价下方2%）
+                        'stop_loss': round(current_price * 0.90, 2),  # 止损位（当前价下方10%）
+                        'take_profit': round(current_price * 1.20, 2)  # 止盈位（当前价上方20%）
+                    }
+                    
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        print(f"处理股票 {symbol} 时出错: {e}")
+                        return None
+                    time.sleep(1)  # 等待1秒后重试
+                    
         except Exception as e:
             print(f"处理股票 {symbol} 时出错: {e}")
             return None
@@ -162,16 +196,23 @@ class Strategy:
         获取股票名称和行业信息
         """
         try:
-            # 获取A股实时行情数据
-            stock_zh_a_spot = ak.stock_zh_a_spot_em()
-            stock_info = stock_zh_a_spot[stock_zh_a_spot['代码'] == symbol]
-            
-            if len(stock_info) > 0:
-                name = stock_info['名称'].iloc[0]
-                industry = stock_info['行业'].iloc[0] if '行业' in stock_info.columns else ''
-                return name, industry
-            else:
-                return '', ''
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    # 获取A股实时行情数据
+                    stock_zh_a_spot = ak.stock_zh_a_spot_em()
+                    stock_info = stock_zh_a_spot[stock_zh_a_spot['代码'] == symbol]
+                    
+                    if len(stock_info) > 0:
+                        name = stock_info['名称'].iloc[0]
+                        industry = stock_info['行业'].iloc[0] if '行业' in stock_info.columns else ''
+                        return name, industry
+                    else:
+                        return '', ''
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        return '', ''
+                    time.sleep(1)
         except:
             return '', ''
     
@@ -183,6 +224,10 @@ class Strategy:
         
         # 获取股票池
         stock_pool = self.get_stock_pool()
+        
+        if stock_pool.empty:
+            print("未能获取到股票池，策略执行终止")
+            return pd.DataFrame()
         
         results = []
         
@@ -217,7 +262,29 @@ def generate_obsidian_note(df: pd.DataFrame):
     """
     if df.empty:
         print("没有找到符合条件的股票")
-        return
+        # 创建空的报告文件
+        today = datetime.now().strftime('%Y-%m-%d')
+        filename = f"stock_selection_{today}.md"
+        
+        # YAML frontmatter
+        frontmatter = {
+            'date': today,
+            'tags': ['#量化选股', '#待观察'],
+            'title': f'股票筛选结果 {today}'
+        }
+        
+        md_content = "---\n"
+        md_content += yaml.dump(frontmatter, allow_unicode=True)
+        md_content += "---\n\n"
+        md_content += f"# {today} 量化选股结果\n\n"
+        md_content += "今日未找到符合策略条件的股票。\n\n"
+        
+        # 保存文件
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+        
+        print(f"空结果报告已保存至 {filename}")
+        return filename
     
     # 创建Obsidian格式的笔记
     today = datetime.now().strftime('%Y-%m-%d')
@@ -234,11 +301,11 @@ def generate_obsidian_note(df: pd.DataFrame):
     md_content += yaml.dump(frontmatter, allow_unicode=True)
     md_content += "---\n\n"
     md_content += f"# {today} 量化选股结果\n\n"
-    md_content += "| 股票代码 | 股票名称 | 现价 | 总市值(亿) | 涨停日期 | 涨停次日量比 | 行业板块 |\n"
-    md_content += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    md_content += "| 股票代码 | 股票名称 | 现价 | 总市值(亿) | 涨停日期 | 涨停次日量比 | 买入点 | 止损位 | 止盈位 | 行业板块 |\n"
+    md_content += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     
     for _, row in df.iterrows():
-        md_content += f"| {row['code']} | {row['name']} | {row['current_price']} | {row['market_cap']} | {row['limit_up_date']} | {row['volume_ratio']} | {row['industry']} |\n"
+        md_content += f"| {row['code']} | {row['name']} | {row['current_price']} | {row['market_cap']} | {row['limit_up_date']} | {row['volume_ratio']} | {row['buy_point']} | {row['stop_loss']} | {row['take_profit']} | {row['industry']} |\n"
     
     # 保存文件
     with open(filename, 'w', encoding='utf-8') as f:
@@ -246,50 +313,6 @@ def generate_obsidian_note(df: pd.DataFrame):
     
     print(f"结果已保存至 {filename}")
     return filename
-
-
-def auto_commit_and_push(file_path: str):
-    """
-    自动提交并推送结果到GitHub
-    """
-    try:
-        import git
-        from git import Repo
-        import subprocess
-        
-        # 检查是否在git仓库中
-        try:
-            repo = Repo(search_parent_directories=True)
-            repo_path = repo.working_tree_dir
-        except:
-            print("当前目录不在git仓库中，正在初始化...")
-            repo = Repo.init()
-            repo_path = repo.working_dir
-        
-        # 添加文件
-        repo.index.add([file_path])
-        
-        # 提交
-        commit_msg = f"feat: 添加 {datetime.now().strftime('%Y-%m-%d')} 量化选股结果"
-        repo.index.commit(commit_msg)
-        
-        # 推送到远程仓库
-        origin = repo.remote(name='origin')
-        origin.push()
-        
-        print(f"文件 {file_path} 已自动提交并推送至GitHub")
-        
-    except ImportError:
-        print("未安装GitPython库，尝试使用subprocess...")
-        try:
-            subprocess.run(['git', 'add', file_path], check=True)
-            subprocess.run(['git', 'commit', '-m', f"feat: 添加 {datetime.now().strftime('%Y-%m-%d')} 量化选股结果"], check=True)
-            subprocess.run(['git', 'push'], check=True)
-            print(f"文件 {file_path} 已自动提交并推送至GitHub")
-        except subprocess.CalledProcessError as e:
-            print(f"自动提交失败: {e}")
-    except Exception as e:
-        print(f"自动提交过程出错: {e}")
 
 
 def main():
@@ -306,11 +329,16 @@ def main():
         # 生成Obsidian笔记
         file_path = generate_obsidian_note(results)
         
-        # 自动提交到GitHub
-        if file_path:
-            auto_commit_and_push(file_path)
+        print(f"\n选股结果已保存到本地文件: {file_path}")
+        print("请注意：文件已保存到本地，您可以手动复制到Obsidian仓库中")
     else:
         print("\n未找到符合条件的股票")
+        
+        # 生成空结果报告
+        file_path = generate_obsidian_note(results)
+        
+        print(f"\n选股结果已保存到本地文件: {file_path}")
+        print("请注意：文件已保存到本地，您可以手动复制到Obsidian仓库中")
 
 
 if __name__ == "__main__":
