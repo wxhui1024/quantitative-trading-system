@@ -40,7 +40,7 @@ class Strategy:
         """创建带重试机制的会话"""
         session = requests.Session()
         retry_strategy = Retry(
-            total=3,
+            total=5,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
         )
@@ -51,9 +51,18 @@ class Strategy:
 
     def get_trading_dates(self, end_date: str, n_days: int) -> list:
         """获取n个交易日的日期列表"""
-        trading_dates = ak.tool_trade_date_hist_sina()
-        trading_dates = trading_dates[trading_dates['trade_date'] <= end_date]
-        return trading_dates['trade_date'].tail(n_days).tolist()
+        try:
+            trading_dates = ak.tool_trade_date_hist_sina()
+            trading_dates = trading_dates[trading_dates['trade_date'] <= end_date]
+            return trading_dates['trade_date'].tail(n_days).tolist()
+        except Exception as e:
+            print(f"获取交易日历失败: {e}")
+            # 如果获取失败，返回一个近似的日期列表
+            dates = []
+            current_date = datetime.strptime(end_date, '%Y-%m-%d')
+            for i in range(n_days):
+                dates.append((current_date - timedelta(days=i)).strftime('%Y-%m-%d'))
+            return dates
 
     def get_stock_pool(self) -> pd.DataFrame:
         """
@@ -61,7 +70,7 @@ class Strategy:
         """
         print("正在获取股票列表...")
         
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 # 获取A股实时行情数据
@@ -83,10 +92,11 @@ class Strategy:
                 return stock_pool
             except Exception as e:
                 print(f"获取股票池失败，第 {attempt + 1} 次尝试: {e}")
-                if attempt == max_retries - 1:
+                if attempt < max_retries - 1:
+                    time.sleep(2 * (attempt + 1))  # 递增等待时间
+                else:
                     print("获取股票池失败，返回空数据")
                     return pd.DataFrame()
-                time.sleep(2)  # 等待2秒后重试
         return pd.DataFrame()
     
     def check_pattern_single(self, symbol: str) -> Dict:
@@ -94,7 +104,7 @@ class Strategy:
         检查单只股票是否满足涨停双响炮/涨停启动->爆量->缩量洗盘形态
         """
         try:
-            max_retries = 2
+            max_retries = 3
             for attempt in range(max_retries):
                 try:
                     # 获取股票历史数据 - 获取更多数据以确保有25个交易日
@@ -224,7 +234,7 @@ class Strategy:
                     if attempt == max_retries - 1:
                         print(f"处理股票 {symbol} 时出错: {e}")
                         return None
-                    time.sleep(1)  # 等待1秒后重试
+                    time.sleep(1 * (attempt + 1))  # 递增等待时间
                     
         except Exception as e:
             print(f"处理股票 {symbol} 时出错: {e}")
@@ -235,7 +245,7 @@ class Strategy:
         获取股票名称和行业信息
         """
         try:
-            max_retries = 2
+            max_retries = 3
             for attempt in range(max_retries):
                 try:
                     # 获取A股实时行情数据
@@ -251,7 +261,7 @@ class Strategy:
                 except Exception as e:
                     if attempt == max_retries - 1:
                         return '', ''
-                    time.sleep(1)
+                    time.sleep(1 * (attempt + 1))
         except:
             return '', ''
     
@@ -270,7 +280,7 @@ class Strategy:
         
         # 使用多线程处理
         results = []
-        max_workers = 10
+        max_workers = 8  # 调整为8个线程，避免过于频繁的请求
         
         print(f"开始多线程扫描 {len(stock_pool)} 只股票...")
         
@@ -296,7 +306,7 @@ class Strategy:
                     print(f"处理股票 {symbol} 时出错: {e}")
                 
                 # 防止请求过快
-                time.sleep(0.1)
+                time.sleep(0.2)  # 增加延时，减少请求频率
         
         if results:
             df_results = pd.DataFrame(results)
