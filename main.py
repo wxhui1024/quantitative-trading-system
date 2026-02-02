@@ -175,12 +175,13 @@ class Strategy:
                     if burst_day_idx >= len(hist_data):
                         return None
                     
-                    # 检查爆量条件
+                    # 检查爆量条件（调整：涨停次日成交量只需大于涨停日成交量）
                     start_vol = hist_data['成交量'].iloc[final_start_idx]
                     burst_vol = hist_data['成交量'].iloc[burst_day_idx]
                     
                     volume_ratio = burst_vol / start_vol if start_vol > 0 else 0
-                    if volume_ratio < self.volume_threshold:
+                    # 修改：只要涨停次日成交量大于涨停日成交量即可
+                    if burst_vol <= start_vol:
                         return None
                     
                     # 检查从爆量日之后直到T日的缩量洗盘条件
